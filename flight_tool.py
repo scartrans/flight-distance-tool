@@ -14,6 +14,10 @@ from tkinter import filedialog, messagebox, ttk
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+try:
+    from pypinyin import lazy_pinyin
+except ImportError:  # Development fallback; the Windows build always bundles pypinyin.
+    lazy_pinyin = None
 
 
 APP_NAME = "机票航段整理工具"
@@ -73,6 +77,15 @@ def airport_code(label):
     if re.fullmatch(r"[A-Za-z]{3}", value):
         return value.upper()
     return AIRPORT_ALIASES.get(value, "")
+
+
+def chinese_to_pinyin(name):
+    """Convert a Chinese name to uppercase Hanyu Pinyin, separated by spaces."""
+    if not name or not re.search(r"[\u3400-\u9fff]", str(name)):
+        return ""
+    if lazy_pinyin is None:
+        return str(name).strip()
+    return " ".join(lazy_pinyin(str(name).strip())).upper()
 
 
 def haversine(lat1, lon1, lat2, lon2):
@@ -153,7 +166,8 @@ def parse_record(raw, source_row, year):
             dist = None
             if a in AIRPORTS and b in AIRPORTS:
                 dist = haversine(AIRPORTS[a][2], AIRPORTS[a][3], AIRPORTS[b][2], AIRPORTS[b][3])
-            legs.append({"source_row": source_row, "leg": leg_index, "name": name, "date": dt,
+            legs.append({"source_row": source_row, "leg": leg_index, "name": name, "chinese_name": "",
+                         "english_name": name, "date": dt,
                          "from": a, "to": b, "distance": dist, "notes": "; ".join(notes),
                          "include": "否" if cancelled else "是", "warning": "; ".join(warning), "raw": text})
     return legs, ""
@@ -233,7 +247,10 @@ def parse_structured_record(rec, source_row):
         if a in AIRPORTS and b in AIRPORTS:
             dist = haversine(AIRPORTS[a][2], AIRPORTS[a][3], AIRPORTS[b][2], AIRPORTS[b][3])
         notes = "; ".join(x for x in [data["department"], data["status"], data["english_name"]] if x)
-        legs.append({"source_row": source_row, "leg": idx, "name": data["name"], "date": dt,
+        english_name = data["english_name"] or chinese_to_pinyin(data["name"])
+        legs.append({"source_row": source_row, "leg": idx, "name": data["name"],
+                     "chinese_name": data["name"] if re.search(r"[\u3400-\u9fff]", data["name"]) else "",
+                     "english_name": english_name, "date": dt,
                      "from": a or labels[idx-1], "to": b or labels[idx], "distance": dist,
                      "notes": notes, "include": "否" if cancelled else "是",
                      "warning": "; ".join(warning), "raw": rec["raw"]})
@@ -265,19 +282,20 @@ def process_file(input_path, output_path, year):
     wb = Workbook()
     ws = wb.active
     ws.title = "航段明细"
-    headers = ["原始序号", "来源工作表", "来源行号", "航段序号", "姓名", "日期", "出发机场", "出发纬度",
+    headers = ["原始序号", "来源工作表", "来源行号", "航段序号", "姓名", "中文姓名", "英文姓名", "日期", "出发机场", "出发纬度",
                "出发经度", "到达机场", "到达纬度", "到达经度", "大圆距离(km)", "备注", "建议计入后续核算",
                "异常/复核提示", "疑似重复原始记录", "原始记录"]
     ws.append(headers)
     for leg in all_legs:
         src = records[leg["source_row"] - 1]
         fa, ta = AIRPORTS.get(leg["from"]), AIRPORTS.get(leg["to"])
-        ws.append([leg["source_row"], src["sheet"], src["row"], leg["leg"], leg["name"], leg["date"], leg["from"],
+        ws.append([leg["source_row"], src["sheet"], src["row"], leg["leg"], leg["name"],
+                   leg["chinese_name"], leg["english_name"], leg["date"], leg["from"],
                    fa[2] if fa else None, fa[3] if fa else None, leg["to"], ta[2] if ta else None,
                    ta[3] if ta else None, leg["distance"], leg["notes"], leg["include"], leg["warning"],
                    "是" if dupes[src["raw"].upper()] > 1 else "", leg["raw"]])
-    for cell in ws["F"][1:]: cell.number_format = "yyyy-mm-dd"
-    style_sheet(ws, [10, 14, 10, 10, 22, 13, 11, 12, 12, 11, 12, 12, 16, 16, 18, 26, 18, 70])
+    for cell in ws["H"][1:]: cell.number_format = "yyyy-mm-dd hh:mm"
+    style_sheet(ws, [10, 14, 10, 10, 20, 14, 24, 18, 11, 12, 12, 11, 12, 12, 16, 20, 18, 26, 18, 70])
 
     used = sorted({leg[x] for leg in all_legs for x in ("from", "to")})
     ap = wb.create_sheet("机场坐标")
@@ -309,6 +327,7 @@ def process_file(input_path, output_path, year):
     info.append(["处理结果", f"识别原始记录 {len(records)} 条，拆分航段 {len(all_legs)} 条，异常复核 {review.max_row-1} 条。"])
     info.append(["距离算法", "Haversine 大圆距离，地球平均半径 6371 km；结果不含碳排放量。"])
     info.append(["数据安全", "全程在本机离线处理，不上传原始表格。"])
+    info.append(["姓名转换", "已有英文姓名时原样保留；只有中文姓名时转换为大写汉语拼音。拼音不等同于护照拼写，正式申报前请核对。"])
     style_sheet(info, [20, 95])
     wb.save(output_path)
     return len(records), len(all_legs), review.max_row - 1
