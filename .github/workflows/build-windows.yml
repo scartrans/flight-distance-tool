@@ -1,0 +1,35 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Build EXE
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name "机票航段整理工具" --collect-data airportsdata --hidden-import openpyxl.cell._writer flight_tool.py
+      - name: Smoke test executable
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/机票航段整理工具.exe")) { throw "EXE not found" }
+          $size = (Get-Item "dist/机票航段整理工具.exe").Length
+          if ($size -lt 5000000) { throw "EXE is unexpectedly small: $size" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flight-distance-tool-windows
+          path: dist/机票航段整理工具.exe
+          if-no-files-found: error
+          retention-days: 30
