@@ -19,8 +19,10 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: pip install -r requirements.txt
+      - name: Test Chinese-name conversion
+        run: python -c "from flight_tool import chinese_to_pinyin; assert chinese_to_pinyin('张三') == 'ZHANG SAN'"
       - name: Build EXE
-        run: pyinstaller --noconfirm --clean --onefile --windowed --name "机票航段整理工具" --collect-data airportsdata --hidden-import openpyxl.cell._writer flight_tool.py
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name "机票航段整理工具" --collect-data airportsdata --collect-data pypinyin --hidden-import openpyxl.cell._writer flight_tool.py
       - name: Smoke test executable
         shell: pwsh
         run: |
