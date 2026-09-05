@@ -23,10 +23,19 @@ MONTHS = {m: i for i, m in enumerate(
 ROUTE_RE = re.compile(r"\b[A-Z]{3}(?:\s*-\s*[A-Z]{3})+\b")
 DATE_RE = re.compile(r"(?<![A-Z0-9])(\d{1,2})\s*([A-Z]{3})(?![A-Z])", re.I)
 TICKET_RE = re.compile(r"(?:\bAIR\s*TICKET|\bAITICKET|\bTICKET\b)", re.I)
+AIRPORT_ALIASES = {
+    "成都天府": "TFU", "天府": "TFU", "成都天府国际机场": "TFU",
+    "亚的斯亚贝巴": "ADD", "亚的斯亚贝巴博莱": "ADD", "亚的斯亚贝巴博莱国际机场": "ADD",
+    "维多利亚瀑布": "VFA", "维多利亚瀑布机场": "VFA",
+    "广州白云": "CAN", "广州白云国际机场": "CAN",
+    "北京首都": "PEK", "上海浦东": "PVG", "哈拉雷": "HRE", "布拉瓦约": "BUQ",
+    "卢萨卡": "LUN", "开普敦": "CPT", "马普托": "MPM",
+}
 
 # This small fallback covers the user's historical workbook. The packaged EXE also
 # contains the complete airportsdata IATA database and works without the internet.
 FALLBACK_AIRPORTS = {
+    "ADD": ("Addis Ababa Bole International Airport", "HAAB", 8.9779, 38.7993, "Ethiopia"),
     "BUQ": ("Joshua Mqabuko Nkomo International Airport", "FVBU", -20.0174, 28.6179, "Zimbabwe"),
     "CAN": ("Guangzhou Baiyun International Airport", "ZGGG", 23.3924, 113.2988, "China"),
     "CPT": ("Cape Town International Airport", "FACT", -33.9697, 18.5972, "South Africa"),
@@ -57,6 +66,13 @@ def load_airports():
 
 
 AIRPORTS = load_airports()
+
+
+def airport_code(label):
+    value = normalize(label).replace("国际机场", "").replace("机场", "").strip()
+    if re.fullmatch(r"[A-Za-z]{3}", value):
+        return value.upper()
+    return AIRPORT_ALIASES.get(value, "")
 
 
 def haversine(lat1, lon1, lat2, lon2):
@@ -143,6 +159,16 @@ def parse_record(raw, source_row, year):
     return legs, ""
 
 
+def parse_full_datetime(value):
+    if isinstance(value, datetime):
+        return value
+    s = str(value).strip()
+    for fmt in ("%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M", "%Y-%m-%d", "%Y/%m/%d"):
+        try: return datetime.strptime(s, fmt)
+        except ValueError: pass
+    return None
+
+
 def extract_records(path):
     wb = load_workbook(path, read_only=True, data_only=True)
     records = []
@@ -151,13 +177,67 @@ def extract_records(path):
     sheets = [wb["原始记录"]] if "原始记录" in wb.sheetnames else [
         ws for ws in wb.worksheets if ws.title not in {"航段明细", "机场坐标", "异常复核", "说明"}
     ]
+    # First support travel-agent statements with separate named columns.
+    for ws in sheets:
+        header_row = None
+        header_map = {}
+        for row_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=min(ws.max_row or 1, 30), values_only=True), 1):
+            labels = [str(v).strip() if v is not None else "" for v in row]
+            if "中文行程" in labels and "航班日期" in labels:
+                header_row = row_idx
+                header_map = {v: i for i, v in enumerate(labels) if v}
+                break
+        if header_row:
+            for row_idx, row in enumerate(ws.iter_rows(min_row=header_row + 1, values_only=True), header_row + 1):
+                def val(name):
+                    idx = header_map.get(name)
+                    return row[idx] if idx is not None and idx < len(row) else None
+                itinerary = val("中文行程")
+                if not itinerary: continue
+                labels = [normalize(x) for x in re.split(r"\s*-\s*", str(itinerary)) if normalize(x)]
+                codes = [airport_code(x) for x in labels]
+                dates = [parse_full_datetime(x) for x in str(val("航班日期") or "").split("/")]
+                dates = [x for x in dates if x]
+                eng_name = re.sub(r"\s+(MR|MRS|MS|MISS)$", "", str(val("乘客姓名") or "").strip(), flags=re.I)
+                cn_name = str(val("中文姓名") or "").strip()
+                status = str(val("订单状态") or "").strip()
+                dept = str(val("部门") or "").strip()
+                raw = " | ".join(str(x) for x in row if x not in (None, ""))
+                structured = {"labels": labels, "codes": codes, "dates": dates,
+                              "name": cn_name or eng_name, "english_name": eng_name,
+                              "status": status, "department": dept}
+                records.append({"sheet": ws.title, "row": row_idx, "raw": raw, "structured": structured})
+            if records:
+                return records
     for ws in sheets:
         for row_idx, row in enumerate(ws.iter_rows(values_only=True), 1):
             for value in row:
                 if isinstance(value, str) and TICKET_RE.search(value) and ROUTE_RE.search(value.upper()):
-                    records.append((ws.title, row_idx, normalize(value)))
+                    records.append({"sheet": ws.title, "row": row_idx, "raw": normalize(value), "structured": None})
                     break
     return records
+
+
+def parse_structured_record(rec, source_row):
+    data = rec["structured"]
+    codes, labels, dates = data["codes"], data["labels"], data["dates"]
+    cancelled = any(k in data["status"] for k in ("取消", "退款", "退票"))
+    legs = []
+    for idx, (a, b) in enumerate(zip(codes, codes[1:]), 1):
+        warning = []
+        if not a: warning.append(f"未知机场:{labels[idx-1]}")
+        if not b: warning.append(f"未知机场:{labels[idx]}")
+        dt = dates[min(idx - 1, len(dates) - 1)] if dates else None
+        if dt is None: warning.append("日期缺失")
+        dist = None
+        if a in AIRPORTS and b in AIRPORTS:
+            dist = haversine(AIRPORTS[a][2], AIRPORTS[a][3], AIRPORTS[b][2], AIRPORTS[b][3])
+        notes = "; ".join(x for x in [data["department"], data["status"], data["english_name"]] if x)
+        legs.append({"source_row": source_row, "leg": idx, "name": data["name"], "date": dt,
+                     "from": a or labels[idx-1], "to": b or labels[idx], "distance": dist,
+                     "notes": notes, "include": "否" if cancelled else "是",
+                     "warning": "; ".join(warning), "raw": rec["raw"]})
+    return legs
 
 
 def style_sheet(ws, widths):
@@ -173,11 +253,14 @@ def style_sheet(ws, widths):
 def process_file(input_path, output_path, year):
     records = extract_records(input_path)
     all_legs, failed = [], []
-    for seq, (sheet, row, raw) in enumerate(records, 1):
-        legs, error = parse_record(raw, seq, year)
-        if error: failed.append((seq, sheet, row, error, raw))
+    for seq, rec in enumerate(records, 1):
+        if rec["structured"]:
+            legs, error = parse_structured_record(rec, seq), ""
+        else:
+            legs, error = parse_record(rec["raw"], seq, year)
+        if error: failed.append((seq, rec["sheet"], rec["row"], error, rec["raw"]))
         all_legs.extend(legs)
-    dupes = Counter(x[2].upper() for x in records)
+    dupes = Counter(x["raw"].upper() for x in records)
 
     wb = Workbook()
     ws = wb.active
@@ -189,10 +272,10 @@ def process_file(input_path, output_path, year):
     for leg in all_legs:
         src = records[leg["source_row"] - 1]
         fa, ta = AIRPORTS.get(leg["from"]), AIRPORTS.get(leg["to"])
-        ws.append([leg["source_row"], src[0], src[1], leg["leg"], leg["name"], leg["date"], leg["from"],
+        ws.append([leg["source_row"], src["sheet"], src["row"], leg["leg"], leg["name"], leg["date"], leg["from"],
                    fa[2] if fa else None, fa[3] if fa else None, leg["to"], ta[2] if ta else None,
                    ta[3] if ta else None, leg["distance"], leg["notes"], leg["include"], leg["warning"],
-                   "是" if dupes[src[2].upper()] > 1 else "", leg["raw"]])
+                   "是" if dupes[src["raw"].upper()] > 1 else "", leg["raw"]])
     for cell in ws["F"][1:]: cell.number_format = "yyyy-mm-dd"
     style_sheet(ws, [10, 14, 10, 10, 22, 13, 11, 12, 12, 11, 12, 12, 16, 16, 18, 26, 18, 70])
 
@@ -206,7 +289,7 @@ def process_file(input_path, output_path, year):
 
     raw_ws = wb.create_sheet("原始记录")
     raw_ws.append(["原始序号", "来源工作表", "来源行号", "原始票务记录"])
-    for seq, rec in enumerate(records, 1): raw_ws.append([seq, rec[0], rec[1], rec[2]])
+    for seq, rec in enumerate(records, 1): raw_ws.append([seq, rec["sheet"], rec["row"], rec["raw"]])
     style_sheet(raw_ws, [12, 18, 12, 90])
 
     review = wb.create_sheet("异常复核")
@@ -215,7 +298,7 @@ def process_file(input_path, output_path, year):
     for leg in all_legs:
         if leg["warning"]:
             src = records[leg["source_row"] - 1]
-            review.append([leg["source_row"], src[0], src[1], leg["warning"], leg["raw"]])
+            review.append([leg["source_row"], src["sheet"], src["row"], leg["warning"], leg["raw"]])
     style_sheet(review, [12, 18, 12, 30, 90])
 
     info = wb.create_sheet("说明")
